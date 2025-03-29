@@ -1,6 +1,6 @@
 /****************************************************************************
 
-  Copyright (c) 2021 Ronald Sieber
+  Copyright (c) 2021 - 2025 Ronald Sieber
 
   Project:      ESP32SmartBoard / MQTT Sensors
   Description:  MQTT Client Firmware to interact with ESP32SmartBoard
@@ -25,6 +25,7 @@
   2020/05/14 -rs:   V1.00 Initial version
   2021/01/02 -rs:   V1.10 Add Support for MH-Z19 CO2 Sensor
   2021/07/08 -rs:   V2.00 Integration of BLE Configuration
+  2024/11/08 -rs:   V3.00 Moving MQTT data into JSON objects, add Watchdog
 
 ****************************************************************************/
 
@@ -37,9 +38,12 @@
 #include <DHT.h>                                                        // Requires Library "DHT sensor library" by Adafruit
 #include <MHZ19.h>                                                      // Requires Library "MH-Z19" by Jonathan Dempsey
 #include <SoftwareSerial.h>                                             // Requires Library "EspSoftwareSerial" by Dirk Kaar, Peter Lerup
+#include <ArduinoJson.h>                                                // Requires Library "ArduinoJson" by Benoit Blanchon
+#include <esp_task_wdt.h>
 #include <esp_wifi.h>
 #include "ESP32BleCfgProfile.h"
 #include "ESP32BleAppCfgData.h"
+#include "SimpleMovingAverage.hpp"
 #include "Trace.h"
 
 
@@ -58,7 +62,7 @@
 //  Application Configuration
 //---------------------------------------------------------------------------
 
-const int       APP_VERSION                         = 2;                // 1.xx
+const int       APP_VERSION                         = 3;                // 3.xx
 const int       APP_REVISION                        = 0;                // x.00
 const char      APP_BUILD_TIMESTAMP[]               = __DATE__ " " __TIME__;
 
@@ -68,6 +72,8 @@ const int       DEFAULT_CFG_ENABLE_DI_DO            = 1;
 const int       DEFAULT_CFG_ENABLE_DHT_SENSOR       = 1;
 const int       DEFAULT_CFG_ENABLE_MHZ_SENSOR       = 1;
 const int       DEFAULT_CFG_ENABLE_STATUS_LED       = 1;
+const int       DEFAULT_CFG_ENABLE_HW_WDT           = 1;                // ESP32 internal Task Watchdog Timer (TWDT)
+const int       DEFAULT_CFG_SRV_WDT_ON_MQTT_RECV    = 1;                // Serve/Trigger of Watchdog is dependent on the reception of MQTT Data Packets
 
 // EEPROM Size
 #define         APP_EEPROM_SIZE                     512
@@ -77,7 +83,7 @@ const int       DEFAULT_CFG_ENABLE_STATUS_LED       = 1;
 
 // Default/initial values for Application Configuration <tAppCfgData>
 #define         APP_CFGDATA_MAGIC_ID                0x45735243          // ASCII 'EsRC' = [Es]p32[R]emote[C]onfig
-#define         APP_DEFAULT_DEVICE_NAME             "{SmBrd_IoT}"       // will be replaced at runtime by <strChipID_g>
+#define         APP_DEFAULT_DEVICE_NAME             "{SmBrd_HIC}"       // will be replaced at runtime by <strChipID_g>
 #define         APP_DEFAULT_WIFI_SSID               "{WIFI SSID Name}"
 #define         APP_DEFAULT_WIFI_PASSWD             "{WIFI Password}"
 #define         APP_DEFAULT_WIFI_OWNADDR            "0.0.0.0:0"         // DHCP: IP(0,0,0,0), otherwise static IP Address if running in Station Mode
@@ -87,8 +93,8 @@ const int       DEFAULT_CFG_ENABLE_STATUS_LED       = 1;
 #define         APP_DEFAULT_APP_RT_OPT3             DEFAULT_CFG_ENABLE_DHT_SENSOR
 #define         APP_DEFAULT_APP_RT_OPT4             DEFAULT_CFG_ENABLE_MHZ_SENSOR
 #define         APP_DEFAULT_APP_RT_OPT5             DEFAULT_CFG_ENABLE_STATUS_LED
-#define         APP_DEFAULT_APP_RT_OPT6             false
-#define         APP_DEFAULT_APP_RT_OPT7             false
+#define         APP_DEFAULT_APP_RT_OPT6             DEFAULT_CFG_ENABLE_HW_WDT
+#define         APP_DEFAULT_APP_RT_OPT7             DEFAULT_CFG_SRV_WDT_ON_MQTT_RECV
 #define         APP_DEFAULT_APP_RT_OPT8             false
 #define         APP_DEFAULT_APP_RT_PEERADDR         "0.0.0.0:0"
 
@@ -100,10 +106,17 @@ const int       DEFAULT_CFG_ENABLE_STATUS_LED       = 1;
 #define         APP_LABEL_APP_RT_OPT3               "Use DHT22 Sensor"
 #define         APP_LABEL_APP_RT_OPT4               "Use MH-Z19 Sensor"
 #define         APP_LABEL_APP_RT_OPT5               "Use Status LED"
-#define         APP_LABEL_APP_RT_OPT6               "# (not used)"      // Start with '#' -> disable in GUI Config Tool
-#define         APP_LABEL_APP_RT_OPT7               "# (not used)"
-#define         APP_LABEL_APP_RT_OPT8               "# (not used)"
+#define         APP_LABEL_APP_RT_OPT6               "Use HW WDT"
+#define         APP_LABEL_APP_RT_OPT7               "Srv WDT on MQTT Recv"
+#define         APP_LABEL_APP_RT_OPT8               "# (not used)"      // Start with '#' -> disable in GUI Config Tool
 #define         APP_LABEL_APP_RT_PEERADDR           "MQTT Broker"
+
+// Simple Moving Average Filter Size
+const int       APP_SMA_DHT_SAMPLE_WINDOW_SIZE      = 10;               // Window Size of Simple Moving Average Filter for DHT-Sensor (Temperature/Humidity)
+
+// Watchdog / Program Execution Monitoring
+const ulong     APP_WDT_TIMEOUT                     = 5;                // WatchDog Timeout in [sec]
+const ulong     APP_WINSIZE_NON_ACK_MQTT_PACKETS    = 5;                // Window size for non-acknowledged MQTT Data Packets
 
 
 
@@ -136,9 +149,9 @@ typedef  void (*tMqttSubCallback)(const char* pszMsgTopic_p, const uint8_t* pMsg
 // WIFI_PS_NONE:        No PowerSaving,     Power Consumption: 110mA, immediate processing of receipt mqtt messages
 // WIFI_PS_MIN_MODEM:   PowerSaving active, Power Consumption:  45mA, up to 5 sec delayed processing of receipt mqtt messages
 // WIFI_PS_MAX_MODEM:   interval to receive beacons is determined by the listen_interval parameter in <wifi_sta_config_t>
-wifi_ps_type_t  WIFI_POWER_SAVING_MODE              = WIFI_PS_MIN_MODEM;    // WIFI_PS_NONE
+wifi_ps_type_t  WIFI_POWER_SAVING_MODE              = WIFI_PS_NONE;     // Disable ESP32 WiFi Power-Saving Mode, otherwise received packets will only be processed with a very long delay (see https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/wifi.html)
 
-const uint32_t  WIFI_TRY_CONNECT_TIMEOUT            = 30000;            // Timeout for trying to connect to WLAN [ms]
+const uint32_t  WIFI_TRY_CONNECT_TIMEOUT            = (30 * 1000);      // Timeout for trying to connect to WLAN [ms]
 
 const String    astrWiFiStatus_g[]                  = { "WL_IDLE_STATUS", "WL_NO_SSID_AVAIL", "WL_SCAN_COMPLETED", "WL_CONNECTED", "WL_CONNECT_FAILED", "WL_CONNECTION_LOST", "WL_DISCONNECTED" };
 
@@ -174,6 +187,9 @@ const bool      DEFAULT_PRINT_MQTT_DATA_PROC        = true;
 const bool      DEFAULT_MHZ19_AUTO_CALIBRATION      = true;
 const bool      DEFAULT_DBG_MHZ19_PRINT_COMM        = false;
 
+const uint32_t  DEFAULT_DATA_PACKET_PUB_CYCLE_TIME  = (     60 * 1000); // Time between MQTT DataPackets [ms]
+const uint32_t  MAX_SET_DATA_PACKET_PUB_CYCLE_TIME  = (30 * 60 * 1000); // max. permissible configuration value for Time between MQTT DataPackets [ms]
+
 
 
 //---------------------------------------------------------------------------
@@ -197,12 +213,12 @@ const int       PIN_STATUS_LED                      =  2;               // On-bo
 
 const int       DHT_TYPE                            = DHT22;            // DHT11, DHT21 (AM2301), DHT22 (AM2302,AM2321)
 const int       DHT_PIN_SENSOR                      = 23;               // PIN used for DHT22 (AM2302/AM2321)
-const uint32_t  DHT_SENSOR_SAMPLE_PERIOD            = 30000;            // Sample Period for DHT-Sensor in [ms]
+const uint32_t  DHT_SENSOR_SAMPLE_PERIOD            = (5 * 1000);       // Sample Period for DHT-Sensor in [ms]
 
 const int       MHZ19_PIN_SERIAL_RX                 = 32;               // ESP32 Rx pin which the MH-Z19 Tx pin is attached to
 const int       MHZ19_PIN_SERIAL_TX                 = 33;               // ESP32 Tx pin which the MH-Z19 Rx pin is attached to
 const int       MHZ19_BAUDRATE_SERIAL               = 9600;             // Serial baudrate for communication with MH-Z19 Device
-const uint32_t  MHZ19_SENSOR_SAMPLE_PERIOD          = 30000;            // Sample Period for MH-Z19-Sensor in [ms]
+const uint32_t  MHZ19_SENSOR_SAMPLE_PERIOD          = (10 * 1000);      // Sample Period for MH-Z19-Sensor in [ms]
 
 
 
@@ -212,11 +228,12 @@ const uint32_t  MHZ19_SENSOR_SAMPLE_PERIOD          = 30000;            // Sampl
 
 // const char*  MQTT_SERVER                         // -> <AppCfgData_g.m_szAppRtPeerAddr>
 // const int    MQTT_PORT                           // -> <AppCfgData_g.m_szAppRtPeerAddr>
-const char*     MQTT_USER                           = "SmBrd_IoT";
+const char*     MQTT_USER                           = "SmBrd_HIC";
 const char*     MQTT_PASSWORD                       = "xxx";
 const char*     MQTT_CLIENT_PREFIX                  = "SmBrd_";         // will be extended by ChipID
 const char*     MQTT_DEVICE_ID                      = NULL;             // will be used to generate Device specific Topics
 const char*     MQTT_SUPERVISOR_TOPIC               = "SmBrd_Supervisor";
+const uint16_t  MQTT_BUFFER_SIZE                    = 2048;             // BuffSize must be at least sufficient for: (sizeof(TOPIC) + sizeof(PAYLOAD) + sizeof(MQTT_HEADER))
 
 // IMPORTANT: The Entries in this Array are accessed via fixed indices
 //            within the Function 'AppProcessMqttDataMessage()'.
@@ -224,22 +241,64 @@ const char*     MQTT_SUBSCRIBE_TOPIC_LIST_TEMPLATE[] =
 {
     "SmBrd/<%>/Settings/Heartbeat",                                     // "<%>" will be replaced by DevID
     "SmBrd/<%>/Settings/LedBarIndicator",                               // "<%>" will be replaced by DevID
+    "SmBrd/<%>/Settings/DataPackPubCycleTime",                          // "<%>" will be replaced by DevID
     "SmBrd/<%>/Settings/PrintSensorVal",                                // "<%>" will be replaced by DevID
     "SmBrd/<%>/Settings/PrintMqttDataProc",                             // "<%>" will be replaced by DevID
     "SmBrd/<%>/OutData/LedBar",                                         // "<%>" will be replaced by DevID
     "SmBrd/<%>/OutData/LedBarInv",                                      // "<%>" will be replaced by DevID
-    "SmBrd/<%>/OutData/Led"                                             // "<%>" will be replaced by DevID
+    "SmBrd/<%>/OutData/Led",                                            // "<%>" will be replaced by DevID
+    "SmBrd/<%>/Ack/PacketNum"                                           // "<%>" will be replaced by DevID
 };
 
 const char*     MQTT_PUBLISH_TOPIC_LIST_TEMPLATE[] =
 {
-    "SmBrd/<%>/InData/Key0",                                            // "<%>" will be replaced by DevID
-    "SmBrd/<%>/InData/Key1",                                            // "<%>" will be replaced by DevID
-    "SmBrd/<%>/InData/Temperature",                                     // "<%>" will be replaced by DevID
-    "SmBrd/<%>/InData/Humidity",                                        // "<%>" will be replaced by DevID
-    "SmBrd/<%>/InData/CO2",                                             // "<%>" will be replaced by DevID
-    "SmBrd/<%>/InData/SensTemp"                                         // "<%>" will be replaced by DevID
+    "SmBrd/<%>/Data/Bootup",                                            // "<%>" will be replaced by DevID
+    "SmBrd/<%>/Data/StData",                                            // "<%>" will be replaced by DevID
 };
+
+
+
+//---------------------------------------------------------------------------
+//  Local types
+//---------------------------------------------------------------------------
+
+// Device Configuration -> Bootup Message
+typedef struct
+{
+    uint32_t    m_ui32MqttPacketNum;
+    int         m_iFirmwareVersion;
+    int         m_iFirmwareRevision;
+    int         m_eBootReason;
+    String      m_strChipID;
+    IPAddress   m_LocalIP;
+    uint32_t    m_ui32DataPackCycleTm;
+    int         m_fCfgNetworkScan;
+    int         m_fCfgDiDo;
+    int         m_fCfgTmpHumSensor;
+    int         m_fCfgCO2Sensor;
+    int         m_fCfgStatusLed;
+    int         m_fCfgHwWdt;
+    int         m_fCfgSrvWdtOnMqttRecv;
+
+} tDeviceConfig;
+
+// SensorData Record -> Cyclic Data Message
+typedef struct
+{
+    uint32_t    m_ui32MqttPacketNum;
+    ulong       m_ulMainLoopCycle;
+    uint32_t    m_ui32Uptime;
+    uint16_t    m_ui16NetErrorLevel;
+    int         m_iKey0;
+    int         m_iKey0Changed;
+    int         m_iKey1;
+    int         m_iKey1Changed;
+    float       m_flTemperature;
+    float       m_flHumidity;
+    int         m_iCo2Value;
+    int         m_iCo2SensTemp;
+
+} tSensorData;
 
 
 
@@ -268,8 +327,8 @@ static tAppCfgData  AppCfgData_g =
     APP_DEFAULT_APP_RT_OPT3,                        // .m_fAppRtOpt3 : 1    -> DEFAULT_CFG_ENABLE_DHT_SENSOR
     APP_DEFAULT_APP_RT_OPT4,                        // .m_fAppRtOpt4 : 1    -> DEFAULT_CFG_ENABLE_MHZ_SENSOR
     APP_DEFAULT_APP_RT_OPT5,                        // .m_fAppRtOpt5 : 1    -> DEFAULT_CFG_ENABLE_STATUS_LED
-    APP_DEFAULT_APP_RT_OPT6,                        // .m_fAppRtOpt6 : 1
-    APP_DEFAULT_APP_RT_OPT7,                        // .m_fAppRtOpt7 : 1
+    APP_DEFAULT_APP_RT_OPT6,                        // .m_fAppRtOpt6 : 1    -> DEFAULT_CFG_ENABLE_HW_WDT
+    APP_DEFAULT_APP_RT_OPT7,                        // .m_fAppRtOpt7 : 1    -> DEFAULT_CFG_SRV_WDT_ON_MQTT_RECV
     APP_DEFAULT_APP_RT_OPT8,                        // .m_fAppRtOpt8 : 1
     APP_DEFAULT_APP_RT_PEERADDR                     // .m_szAppRtPeerAddr
 
@@ -312,18 +371,21 @@ static  String          strChipID_g;
 static  String          strDeviceID_g;
 static  String          strClientName_g;
 
+static  ulong           ulMainLoopCycle_g           = 0;
 static  unsigned int    uiMainLoopProcStep_g        = 0;
+static  uint32_t        ui32LastTickWdtService_g    = 0;
+static  uint16_t        ui16NetErrorLevel_g         = 0;
 static  int             iLastStateKey0_g            = -1;
 static  int             iLastStateKey1_g            = -1;
 
 static  DHT             DhtSensor_g(DHT_PIN_SENSOR, DHT_TYPE);
-static  uint32_t        ui32LastTickDhtRead_g       = 0;
+static  uint32_t        ui32LastTickDhtRead_g       = -(DHT_SENSOR_SAMPLE_PERIOD);              // force reading already in the very first process cycle
 static  float           flDhtTemperature_g          = 0;
 static  float           flDhtHumidity_g             = 0;
 
 static  MHZ19           Mhz19Sensor_g;
 static  SoftwareSerial  Mhz19SoftSerial_g(MHZ19_PIN_SERIAL_RX, MHZ19_PIN_SERIAL_TX);
-static  uint32_t        ui32LastTickMhz19Read_g     = 0;
+static  uint32_t        ui32LastTickMhz19Read_g     = -(MHZ19_SENSOR_SAMPLE_PERIOD);            // force reading already in the very first process cycle
 static  int             iMhz19Co2Value_g            = 0;
 static  int             iMhz19Co2SensTemp_g         = 0;
 static  bool            fMhz19AutoCalibration_g     = DEFAULT_MHZ19_AUTO_CALIBRATION;
@@ -338,8 +400,21 @@ static  tLedBar         LedBarIndicator_g           = DEFAULT_LED_BAR_INDICATOR;
 static  bool            fPrintSensorValues_g        = DEFAULT_PRINT_SENSOR_VALUES;
 static  bool            fPrintMqttDataProc_g        = DEFAULT_PRINT_MQTT_DATA_PROC;
 
+static  tDeviceConfig   DeviceConfig_g              = { 0 };
+static  tSensorData     SensorDataRec_g             = { 0 };
+
+static  uint32_t        ui32MqttPacketNum_g         = 0;
+static  uint32_t        ui32LastAckMqttPacketNum_g  = 0;
+static  uint32_t        ui32DataPackCycleTm_g       = DEFAULT_DATA_PACKET_PUB_CYCLE_TIME;
+static  uint32_t        ui32LastTickDataPackPub_g   = -(DEFAULT_DATA_PACKET_PUB_CYCLE_TIME);    // force reading already in the very first process cycle
+
 static  String          astrMqttSubscribeTopicList_g[ARRAY_SIZE(MQTT_SUBSCRIBE_TOPIC_LIST_TEMPLATE)];
 static  String          astrMqttPublishTopicList_g[ARRAY_SIZE(MQTT_PUBLISH_TOPIC_LIST_TEMPLATE)];
+
+static  esp_reset_reason_t                          eBootReason_g;
+
+static  SimpleMovingAverage<float>                  AverageTemperature_g(APP_SMA_DHT_SAMPLE_WINDOW_SIZE);
+static  SimpleMovingAverage<float>                  AverageHumidity_g(APP_SMA_DHT_SAMPLE_WINDOW_SIZE);
 
 
 
@@ -358,15 +433,17 @@ static  String          astrMqttPublishTopicList_g[ARRAY_SIZE(MQTT_PUBLISH_TOPIC
 void setup()
 {
 
-char  szTextBuff[64];
-char  acMhz19Version[4];
-int   iResult;
-int   iMhz19Param;
-bool  fMhz19AutoCalibration;
-bool  fStateKey0;
-bool  fStateKey1;
-bool  fSensorCalibrated;
-int   iIdx;
+char    szTextBuff[64];
+String  strBootReason;
+char    acMhz19Version[4];
+String  strJsonBootupPacket;
+int     iResult;
+int     iMhz19Param;
+bool    fMhz19AutoCalibration;
+bool    fStateKey0;
+bool    fStateKey1;
+bool    fSensorCalibrated;
+int     iIdx;
 
 
     // Serial console
@@ -396,12 +473,25 @@ int   iIdx;
 
 
     // Initialize Workspace
-    uiMainLoopProcStep_g  = 0;
-    fBleClientConnected_g = false;
-    flDhtTemperature_g    = 0;
-    flDhtHumidity_g       = 0;
-    iMhz19Co2Value_g      = 0;
-    iMhz19Co2SensTemp_g   = 0;
+    ulMainLoopCycle_g          = 0;
+    uiMainLoopProcStep_g       = 0;
+    ui16NetErrorLevel_g        = 0;
+    fBleClientConnected_g      = false;
+    flDhtTemperature_g         = 0;
+    flDhtHumidity_g            = 0;
+    iMhz19Co2Value_g           = 0;
+    iMhz19Co2SensTemp_g        = 0;
+    ui32MqttPacketNum_g        = 0;
+    ui32LastAckMqttPacketNum_g = 0;
+
+
+    // Evaluate Boot/Restart Reason
+    eBootReason_g = esp_reset_reason();
+    Serial.print("Boot/Restart Reason: ");
+    Serial.print((int)eBootReason_g);
+    Serial.print(" -> ");
+    strBootReason = DecodeBootReason(eBootReason_g);
+    Serial.println(strBootReason);
 
 
     // Get Configuration Data from EEPROM
@@ -423,6 +513,11 @@ int   iIdx;
         Serial.print("-> ERROR: Access to EEPROM failed! (ErrorCode=");
         Serial.print(iResult);
         Serial.println(")");
+    }
+    if (strlen(AppCfgData_g.m_szDevMntDevName) == 0)
+    {
+        Serial.println("-> Replace empty DevName with ChipID");
+        strncpy(AppCfgData_g.m_szDevMntDevName, strChipID_g.c_str(), sizeof(AppCfgData_g.m_szDevMntDevName));
     }
     Serial.println("Configuration Data Setup:");
     AppPrintConfigData(&AppCfgData_g);
@@ -504,6 +599,18 @@ int   iIdx;
 
         iLastStateKey0_g = -1;
         iLastStateKey1_g = -1;
+
+
+        // Setup Watchdog
+        if ( AppCfgData_g.m_fAppRtOpt6 )            // -> DEFAULT_CFG_ENABLE_HW_WDT
+        {
+            Serial.println("Setup Watchdog (Task Watchdog Timer)...");
+            snprintf(szTextBuff, sizeof(szTextBuff), "  WDT Timeout:    %d [sec]", APP_WDT_TIMEOUT);
+            Serial.println(szTextBuff);
+            esp_task_wdt_init(APP_WDT_TIMEOUT, true);                       // configure Task Watchdog Timer (TWDT), enable Panic Handler to restart ESP32 when TWDT times out
+            esp_task_wdt_add(NULL);                                         // subscribe current Task to the Task Watchdog Timer (TWDT)
+            ui32LastTickWdtService_g = millis();
+        }
 
 
         // Setup DHT22 Sensor (Temerature/Humidity)
@@ -592,32 +699,43 @@ int   iIdx;
 
         // MQTT Setup
         MqttCheckNetworkConfig(WiFi.localIP(), szAppRtPeerIpAddress_g);
-        strDeviceID_g = GetDeviceID(MQTT_DEVICE_ID);
+        strDeviceID_g = GetDeviceID(AppCfgData_g.m_szDevMntDevName);
         strClientName_g = GetUniqueClientName(MQTT_CLIENT_PREFIX);
         for (iIdx=0; iIdx<ARRAY_SIZE(MQTT_SUBSCRIBE_TOPIC_LIST_TEMPLATE); iIdx++)
         {
-            astrMqttSubscribeTopicList_g[iIdx] = MqttBuildTopicFromTemplate(MQTT_SUBSCRIBE_TOPIC_LIST_TEMPLATE[iIdx], strChipID_g.c_str());
+            astrMqttSubscribeTopicList_g[iIdx] = MqttBuildTopicFromTemplate(MQTT_SUBSCRIBE_TOPIC_LIST_TEMPLATE[iIdx], strDeviceID_g.c_str());
         }
         for (iIdx=0; iIdx<ARRAY_SIZE(MQTT_PUBLISH_TOPIC_LIST_TEMPLATE); iIdx++)
         {
-            astrMqttPublishTopicList_g[iIdx] = MqttBuildTopicFromTemplate(MQTT_PUBLISH_TOPIC_LIST_TEMPLATE[iIdx], strChipID_g.c_str());
+            astrMqttPublishTopicList_g[iIdx] = MqttBuildTopicFromTemplate(MQTT_PUBLISH_TOPIC_LIST_TEMPLATE[iIdx], strDeviceID_g.c_str());
         }
-        MqttPrintTopicLists (String(MQTT_SUPERVISOR_TOPIC), astrMqttSubscribeTopicList_g, ARRAY_SIZE(astrMqttSubscribeTopicList_g), astrMqttPublishTopicList_g, ARRAY_SIZE(astrMqttPublishTopicList_g));
+        MqttPrintTopicLists(String(MQTT_SUPERVISOR_TOPIC), astrMqttSubscribeTopicList_g, ARRAY_SIZE(astrMqttSubscribeTopicList_g), astrMqttPublishTopicList_g, ARRAY_SIZE(astrMqttPublishTopicList_g));
         MqttSetup(szAppRtPeerIpAddress_g, ui16AppRtPeerPortNum_g, AppMqttSubCallback);
         MqttConnect(MQTT_USER, MQTT_PASSWORD, strClientName_g.c_str(), MQTT_SUPERVISOR_TOPIC, fPrintMqttDataProc_g);
         MqttSubscribeTopicList(astrMqttSubscribeTopicList_g, ARRAY_SIZE(astrMqttSubscribeTopicList_g), fPrintMqttDataProc_g);
         Serial.flush();
 
 
-        // Publish initial values
-        if ( AppCfgData_g.m_fAppRtOpt3 )            // -> DEFAULT_CFG_ENABLE_DHT_SENSOR
-        {
-            AppProcessDhtSensor(0, fPrintSensorValues_g, fPrintMqttDataProc_g);
-        }
-        if ( AppCfgData_g.m_fAppRtOpt4 )            // -> DEFAULT_CFG_ENABLE_MHZ_SENSOR
-        {
-            AppProcessMhz19Sensor(0, fPrintSensorValues_g, fPrintMqttDataProc_g);
-        }
+        // Encode and Publish Bootup Packet
+        Serial.println("Encode Bootup Packet...");
+        DeviceConfig_g.m_ui32MqttPacketNum    = ui32MqttPacketNum_g++;
+        DeviceConfig_g.m_iFirmwareVersion     = APP_VERSION;
+        DeviceConfig_g.m_iFirmwareRevision    = APP_REVISION;
+        DeviceConfig_g.m_eBootReason          = (int)eBootReason_g;
+        DeviceConfig_g.m_strChipID            = strChipID_g;
+        DeviceConfig_g.m_LocalIP              = WiFi.localIP();
+        DeviceConfig_g.m_ui32DataPackCycleTm  = ui32DataPackCycleTm_g;          // -> DEFAULT_DATA_PACKET_PUB_CYCLE_TIME
+        DeviceConfig_g.m_fCfgNetworkScan      = AppCfgData_g.m_fAppRtOpt1;      // -> DEFAULT_CFG_ENABLE_NETWORK_SCAN
+        DeviceConfig_g.m_fCfgDiDo             = AppCfgData_g.m_fAppRtOpt2;      // -> DEFAULT_CFG_ENABLE_DI_DO
+        DeviceConfig_g.m_fCfgTmpHumSensor     = AppCfgData_g.m_fAppRtOpt3;      // -> DEFAULT_CFG_ENABLE_DHT_SENSOR
+        DeviceConfig_g.m_fCfgCO2Sensor        = AppCfgData_g.m_fAppRtOpt4;      // -> DEFAULT_CFG_ENABLE_MHZ_SENSOR
+        DeviceConfig_g.m_fCfgStatusLed        = AppCfgData_g.m_fAppRtOpt5;      // -> DEFAULT_CFG_ENABLE_STATUS_LED
+        DeviceConfig_g.m_fCfgHwWdt            = AppCfgData_g.m_fAppRtOpt6;      // -> DEFAULT_CFG_ENABLE_HW_WDT
+        DeviceConfig_g.m_fCfgSrvWdtOnMqttRecv = AppCfgData_g.m_fAppRtOpt7;      // -> DEFAULT_CFG_SRV_WDT_ON_MQTT_RECV
+        strJsonBootupPacket = AppEncodeBootupPacket(&DeviceConfig_g);
+        Serial.println("Bootup Packet: ");
+        Serial.println(strJsonBootupPacket);
+        MqttPublishData(astrMqttPublishTopicList_g[0].c_str(), strJsonBootupPacket.c_str(), true, fPrintMqttDataProc_g);
     }
 
     return;
@@ -633,8 +751,14 @@ int   iIdx;
 void loop()
 {
 
-unsigned int  uiProcStep;
+char          szTextBuff[128];
 uint32_t      ui32CurrTick;
+unsigned int  uiProcStep;
+uint32_t      ui32Uptime;
+String        strUptime;
+String        strJsonDataPacket;
+uint32_t      ui32LastPubMqttPacketNum;
+bool          fRes;
 
 
     // Determine Working Mode (BLE Config or Normal Operation)
@@ -672,66 +796,157 @@ uint32_t      ui32CurrTick;
         AppEnsureNetworkAvailability();
 
         // process WLAN/WIFI and MQTT
-        PubSubClient_g.loop();
+        fRes = PubSubClient_g.loop();
+        if ( !fRes )
+        {
+            Serial.println("ERROR: MQTT Client is no longer connected -> Client.Loop() Failed!");
+        }
 
         // process local periphery (i/o, sensors)
         uiProcStep = uiMainLoopProcStep_g++ % 10;
         switch (uiProcStep)
         {
+            // provide main information
             case 0:
             {
-                // process local digital inputs
-                if ( AppCfgData_g.m_fAppRtOpt2 )            // -> DEFAULT_CFG_ENABLE_DI_DO
-                {
-                    AppProcessInputs();
-                }
+                ulMainLoopCycle_g++;
+                Serial.println();
+                strUptime = GetSysUptime(&ui32Uptime);
+                snprintf(szTextBuff, sizeof(szTextBuff), "Main Loop Cycle: %lu (Uptime: %s)", ulMainLoopCycle_g, strUptime.c_str());
+                Serial.println(szTextBuff);
+                Serial.flush();
+                SensorDataRec_g.m_ulMainLoopCycle = ulMainLoopCycle_g;
+                SensorDataRec_g.m_ui32Uptime = ui32Uptime;
                 break;
             }
 
+            // process local digital inputs
             case 1:
             {
-                // process DHT Sensor (Temperature/Humidity)
-                if ( AppCfgData_g.m_fAppRtOpt3 )            // -> DEFAULT_CFG_ENABLE_DHT_SENSOR
+                if ( AppCfgData_g.m_fAppRtOpt2 )            // -> DEFAULT_CFG_ENABLE_DI_DO
                 {
-                    AppProcessDhtSensor(DHT_SENSOR_SAMPLE_PERIOD, fPrintSensorValues_g, fPrintMqttDataProc_g);
+                    AppProcessInputs(&SensorDataRec_g, fPrintSensorValues_g);
                 }
                 break;
             }
 
+            // process DHT Sensor (Temperature/Humidity)
             case 2:
             {
-                // process MH-Z19 Sensor (CO2Value/SensorTemperature)
-                if ( AppCfgData_g.m_fAppRtOpt4 )            // -> DEFAULT_CFG_ENABLE_MHZ_SENSOR
+                if ( AppCfgData_g.m_fAppRtOpt3 )            // -> DEFAULT_CFG_ENABLE_DHT_SENSOR
                 {
-                    AppProcessMhz19Sensor(MHZ19_SENSOR_SAMPLE_PERIOD, fPrintSensorValues_g, fPrintMqttDataProc_g);
+                    AppProcessDhtSensor(DHT_SENSOR_SAMPLE_PERIOD, &SensorDataRec_g, fPrintSensorValues_g);
                 }
                 break;
             }
+
+            // process MH-Z19 Sensor (CO2Value/SensorTemperature)
             case 3:
+            {
+                if ( AppCfgData_g.m_fAppRtOpt4 )            // -> DEFAULT_CFG_ENABLE_MHZ_SENSOR
+                {
+                    AppProcessMhz19Sensor(MHZ19_SENSOR_SAMPLE_PERIOD, &SensorDataRec_g, fPrintSensorValues_g);
+                }
+                break;
+            }
+
             case 4:
             case 5:
             case 6:
-            case 7:
-            case 8:
             {
                 break;
             }
 
-            case 9:
+            // encode and publish Data Packet
+            case 7:
             {
-                // process LED Bar Indicator depending on its data source
+                ui32CurrTick = millis();
+                if ( ((ui32CurrTick - ui32LastTickDataPackPub_g) >= ui32DataPackCycleTm_g) ||
+                     (SensorDataRec_g.m_iKey0Changed || SensorDataRec_g.m_iKey1Changed) )
+                {
+                    Serial.println("Encode Data Packet...");
+                    SensorDataRec_g.m_ui32MqttPacketNum = ui32MqttPacketNum_g++;
+                    SensorDataRec_g.m_ui16NetErrorLevel = ui16NetErrorLevel_g;
+                    strJsonDataPacket = AppEncodeDataPacket(&SensorDataRec_g);
+                    Serial.println("Data Packet: ");
+                    Serial.println(strJsonDataPacket);
+                    Serial.println("JsonDataPacket Length: " + String(strJsonDataPacket.length()));
+                    fRes = MqttPublishData(astrMqttPublishTopicList_g[1].c_str(), strJsonDataPacket.c_str(), true, fPrintMqttDataProc_g);
+                    if ( !fRes )
+                    {
+                        ui16NetErrorLevel_g += 2;
+                    }
+                    else
+                    {
+                        if (ui16NetErrorLevel_g > 0)
+                        {
+                            ui16NetErrorLevel_g -= 1;
+                        }
+                    }
+                    Serial.println("NetErrorLevel: " + String(ui16NetErrorLevel_g));
+                    Serial.flush();
+
+                    ui32LastTickDataPackPub_g = ui32CurrTick;
+                }
+                else
+                {
+                    snprintf(szTextBuff, sizeof(szTextBuff), "Remaining TimeSpan until publishing next DataPacket: %i [sec]", ((ui32DataPackCycleTm_g - (ui32CurrTick - ui32LastTickDataPackPub_g)) / 1000));
+                    Serial.println(szTextBuff);
+                    Serial.flush();
+                }
+                break;
+            }
+
+            // process LED Bar Indicator depending on its data source
+            case 8:
+            {
                 AppProcessLedBarIndicator();
                 break;
             }
 
+            // service Task Watchdog Timer (TWDT)
+            case 9:
+            {
+                if ( AppCfgData_g.m_fAppRtOpt6 )            // -> DEFAULT_CFG_ENABLE_HW_WDT
+                {
+                    if ( AppCfgData_g.m_fAppRtOpt7 )        // -> DEFAULT_CFG_SRV_WDT_ON_MQTT_RECV
+                    {
+                        ui32LastPubMqttPacketNum = ui32MqttPacketNum_g - 1;
+                        snprintf(szTextBuff, sizeof(szTextBuff), "Last MQTT Packet published: %lu / Last MQTT Packet acknowledged: %lu", ui32LastPubMqttPacketNum, ui32LastAckMqttPacketNum_g);
+                        Serial.println(szTextBuff);
+
+                        if ((ui32LastPubMqttPacketNum - ui32LastAckMqttPacketNum_g) > APP_WINSIZE_NON_ACK_MQTT_PACKETS)
+                        {
+                            snprintf(szTextBuff, sizeof(szTextBuff), "WATCHDOG ALERT: Number of Non-Acknowledged MQTT Packets exceeds permitted Maximum of %lu", APP_WINSIZE_NON_ACK_MQTT_PACKETS);
+                            Serial.println(szTextBuff);
+                            snprintf(szTextBuff, sizeof(szTextBuff), "  -> DON'T TRIGGER WATCHDOG TO FORCE DEVICE REBOOT\n\n");
+                            Serial.println(szTextBuff);
+                            Serial.flush();
+
+                            // WATCHDOG ALERT: exit without servicing Watchog
+                            break;
+                        }
+                    }
+
+                    esp_task_wdt_reset();
+                    ui32CurrTick = millis();
+                    snprintf(szTextBuff, sizeof(szTextBuff), "Service Watchdog (elapsed service interval: %i [ms])", (ui32CurrTick - ui32LastTickWdtService_g));
+                    Serial.println(szTextBuff);
+                    Serial.flush();
+                    ui32LastTickWdtService_g = ui32CurrTick;
+                }
+                break;
+            }
+
+            // catch unexpected ProcSteps
             default:
             {
                 break;
             }
-        }
+        }   // switch (uiProcStep)
 
         // toggle Status LED
-        if ( AppCfgData_g.m_fAppRtOpt5 )            // -> DEFAULT_CFG_ENABLE_STATUS_LED
+        if ( AppCfgData_g.m_fAppRtOpt5 )                    // -> DEFAULT_CFG_ENABLE_STATUS_LED
         {
             if ( fStatusLedHeartbeat_g )
             {
@@ -1016,6 +1231,13 @@ int  iIdx;
         Esp32TimerStart(STATUS_LED_PERIOD_NET_SCAN);                // 10Hz = 50ms On + 50ms Off
     }
 
+    if ( AppCfgData_g.m_fAppRtOpt6 )            // -> DEFAULT_CFG_ENABLE_HW_WDT
+    {
+        // service Task Watchdog Timer (TWDT)
+        esp_task_wdt_reset();
+        ui32LastTickWdtService_g = millis();
+    }
+
 
     Serial.println("Scanning for WLAN Networks...");
     iNumOfWlanNets = WiFi.scanNetworks();
@@ -1040,6 +1262,13 @@ int  iIdx;
 
     Serial.println("");
     Serial.flush();
+
+    if ( AppCfgData_g.m_fAppRtOpt6 )            // -> DEFAULT_CFG_ENABLE_HW_WDT
+    {
+        // service Task Watchdog Timer (TWDT)
+        esp_task_wdt_reset();
+        ui32LastTickWdtService_g = millis();
+    }
 
     if ( AppCfgData_g.m_fAppRtOpt5 )            // -> DEFAULT_CFG_ENABLE_STATUS_LED
     {
@@ -1124,6 +1353,13 @@ bool       fResult;
             Serial.println("");
 
             ESP.restart();
+        }
+
+        if ( AppCfgData_g.m_fAppRtOpt6 )        // -> DEFAULT_CFG_ENABLE_HW_WDT
+        {
+            // service Task Watchdog Timer (TWDT)
+            esp_task_wdt_reset();
+            ui32LastTickWdtService_g = millis();
         }
 
         delay(500);
@@ -1307,11 +1543,12 @@ String     strRuntimeConfig;
 String     strPayloadMsgBody;
 String     strPayloadMsgConnect;
 String     strPayloadMsgGotLost;
+int        iIdx;
 bool       fConnected;
 bool       fRes;
 
 
-    if ( AppCfgData_g.m_fAppRtOpt5 )            // -> DEFAULT_CFG_ENABLE_STATUS_LED
+    if ( AppCfgData_g.m_fAppRtOpt5 )                // -> DEFAULT_CFG_ENABLE_STATUS_LED
     {
         Esp32TimerStart(STATUS_LED_PERIOD_MQTT_CONNECT);            // 2.5Hz = 200ms On + 200ms Off
     }
@@ -1340,6 +1577,19 @@ bool       fRes;
         strPayloadMsgGotLost = strPayloadMsgBody + ", ST=GotLost";
     }
 
+    // adjust MQTT Buffer to necessary size (default is only 256 bytes, which is usually too small)
+    // (the buffer must be large enough to contain the full MQTT packet. The packet will contain the
+    // full topic string, the payload data and a small number of header bytes)
+    Serial.print("Resize MQTT Buffer Size: ");
+    fRes = PubSubClient_g.setBufferSize(MQTT_BUFFER_SIZE);
+    if ( fRes )
+    {
+        Serial.println(" -> ok.");
+    }
+    else
+    {
+        Serial.println(" -> failed.");
+    }
 
     // Connect to MQTT Server
     Serial.print("Connecting to MQTT Server: User='");
@@ -1351,6 +1601,13 @@ bool       fRes;
     fConnected = false;
     do
     {
+        if ( AppCfgData_g.m_fAppRtOpt6 )            // -> DEFAULT_CFG_ENABLE_HW_WDT
+        {
+            // service Task Watchdog Timer (TWDT)
+            esp_task_wdt_reset();
+            ui32LastTickWdtService_g = millis();
+        }
+
         // check if WLAN/WiFi Connection is established
         if (WiFi.status() != WL_CONNECTED)
         {
@@ -1360,6 +1617,7 @@ bool       fRes;
             goto Exit;
         }
 
+        // connect to MQTT Server
         if (pszSupervisorTopic_p != NULL)
         {
             fConnected = PubSubClient_g.connect(strClientId.c_str(),            // ClientID
@@ -1388,7 +1646,16 @@ bool       fRes;
             Serial.print(" -> Failed, rc=");
             Serial.print(PubSubClient_g.state());
             Serial.println(", try again in 5 seconds");
-            delay(5000);
+            for (iIdx=0; iIdx<5; iIdx++)
+            {
+                if ( AppCfgData_g.m_fAppRtOpt6 )    // -> DEFAULT_CFG_ENABLE_HW_WDT
+                {
+                    // service Task Watchdog Timer (TWDT)
+                    esp_task_wdt_reset();
+                    ui32LastTickWdtService_g = millis();
+                }
+                delay(1000);
+            }
         }
     }
     while ( !fConnected );
@@ -1423,9 +1690,12 @@ bool       fRes;
     }
 
 
+    ui16NetErrorLevel_g = 0;
+
+
 Exit:
 
-    if ( AppCfgData_g.m_fAppRtOpt5 )            // -> DEFAULT_CFG_ENABLE_STATUS_LED
+    if ( AppCfgData_g.m_fAppRtOpt5 )                // -> DEFAULT_CFG_ENABLE_STATUS_LED
     {
         Esp32TimerStop();
     }
@@ -1705,17 +1975,96 @@ String        strBuffer;
 //=========================================================================//
 
 //---------------------------------------------------------------------------
+//  Encode Bootup Packet to JSON Object
+//---------------------------------------------------------------------------
+
+String  AppEncodeBootupPacket (const tDeviceConfig* pDeviceConfig_p)
+{
+
+JsonDocument  JsonBootupPacket;
+char          szVerNum[16];
+String        strJsonBootupPacket;
+
+
+    if (pDeviceConfig_p == NULL)
+    {
+        return (String("{}"));
+    }
+
+    JsonBootupPacket["PacketNum"]       = pDeviceConfig_p->m_ui32MqttPacketNum;
+    snprintf(szVerNum, sizeof(szVerNum), "%u.%02u", (unsigned)pDeviceConfig_p->m_iFirmwareVersion, (unsigned)pDeviceConfig_p->m_iFirmwareRevision);
+    JsonBootupPacket["FirmwareVer"]     = szVerNum;
+    JsonBootupPacket["BootReason"]      = pDeviceConfig_p->m_eBootReason;
+    JsonBootupPacket["IP"]              = pDeviceConfig_p->m_LocalIP.toString();
+    JsonBootupPacket["ChipID"]          = pDeviceConfig_p->m_strChipID;
+    JsonBootupPacket["DataPackCycleTm"] = pDeviceConfig_p->m_ui32DataPackCycleTm / 1000;    // [ms] -> [sec]
+    JsonBootupPacket["CfgNetworkScan"]  = pDeviceConfig_p->m_fCfgNetworkScan;
+    JsonBootupPacket["CfgDiDo"]         = pDeviceConfig_p->m_fCfgDiDo;
+    JsonBootupPacket["CfgTmpHumSensor"] = pDeviceConfig_p->m_fCfgTmpHumSensor;
+    JsonBootupPacket["CfgCO2Sensor"]    = pDeviceConfig_p->m_fCfgCO2Sensor;
+    JsonBootupPacket["CfgStatusLed"]    = pDeviceConfig_p->m_fCfgStatusLed;
+    JsonBootupPacket["CfgHwWdt"]        = pDeviceConfig_p->m_fCfgHwWdt;
+    JsonBootupPacket["CfgSrvWdtOnMqtt"] = pDeviceConfig_p->m_fCfgSrvWdtOnMqttRecv;
+
+    serializeJsonPretty(JsonBootupPacket, strJsonBootupPacket);
+
+    return (strJsonBootupPacket);
+
+}
+
+
+
+//---------------------------------------------------------------------------
+//  Encode Data Packet to JSON Object
+//---------------------------------------------------------------------------
+
+String  AppEncodeDataPacket (const tSensorData* pSensorDataRec_p)
+{
+
+JsonDocument  JsonDataPacket;
+String        strJsonDataPacket;
+
+
+    if (pSensorDataRec_p == NULL)
+    {
+        return (String("{}"));
+    }
+
+    JsonDataPacket["PacketNum"]     = pSensorDataRec_p->m_ui32MqttPacketNum;
+    JsonDataPacket["MainLoopCycle"] = pSensorDataRec_p->m_ulMainLoopCycle;
+    JsonDataPacket["Uptime"]        = pSensorDataRec_p->m_ui32Uptime / 1000;                // [ms] -> [sec]
+    JsonDataPacket["NetErrorLevel"] = pSensorDataRec_p->m_ui16NetErrorLevel;
+    JsonDataPacket["Key0"]          = pSensorDataRec_p->m_iKey0;
+    JsonDataPacket["Key0Chng"]      = pSensorDataRec_p->m_iKey0Changed;
+    JsonDataPacket["Key1"]          = pSensorDataRec_p->m_iKey1;
+    JsonDataPacket["Key1Chng"]      = pSensorDataRec_p->m_iKey1Changed;
+    JsonDataPacket["Temperature"]   = ((float)((int)((pSensorDataRec_p->m_flTemperature + 0.05) * 10)) / 10.0);     // limit to only one decimal place
+    JsonDataPacket["Humidity"]      = ((float)((int)((pSensorDataRec_p->m_flHumidity + 0.05) * 10)) / 10.0);        // limit to only one decimal place
+    JsonDataPacket["Co2Value"]      = pSensorDataRec_p->m_iCo2Value;
+    JsonDataPacket["Co2SensTemp"]   = pSensorDataRec_p->m_iCo2SensTemp;
+
+    serializeJsonPretty(JsonDataPacket, strJsonDataPacket);
+
+    return (strJsonDataPacket);
+
+}
+
+
+
+//---------------------------------------------------------------------------
 //  Process received MQTT Data Messages (for subscribed MQTT Topics)
 //---------------------------------------------------------------------------
 
 void  AppProcessMqttDataMessage (String strMsgTopic_p, String strMsgPayload_p)
 {
 
-String  strMsgTopic;
-String  strMsgPayload;
-int     iValue;
-int     iLedNum;
-bool    fLedState;
+String    strMsgTopic;
+String    strMsgPayload;
+int       iValue;
+int64_t   i64Value;
+uint32_t  ui32CurrTick;
+int       iLedNum;
+bool      fLedState;
 
 
     TRACE2("+ 'AppProcessMqttDataMessage()': strMsgTopic_p=%s, strMsgPayload_p=%s\n", strMsgTopic_p.c_str(), strMsgPayload_p.c_str());
@@ -1758,8 +2107,35 @@ bool    fLedState;
             AppPresentLedBar(0);                                    // clear all LEDs in LED Bar
         }
 
-        // Message scheme: 'SmBrd/<DevID>/Settings/PrintSensorVal'
+        // Message scheme: "SmBrd/<DevID>/Settings/DataPackPubCycleTime"
         if (strMsgTopic_p == astrMqttSubscribeTopicList_g[2])
+        {
+            i64Value = strtoll(strMsgPayload.c_str(), NULL, 10);
+            i64Value *= 1000;                                      // [sec] -> [ms]
+            if (i64Value == 0)
+            {
+                // CycleTime = 0 -> Force one-time publishing of Data Packet without changing <ui32DataPackCycleTm_g>
+                ui32CurrTick = millis();
+                ui32LastTickDataPackPub_g = ui32CurrTick - ui32DataPackCycleTm_g;   // mark time interval as expired
+                TRACE0("   Force one-time publishing of Data Packet without changing 'DataPackCycleTm'\n");
+            }
+            else
+            {
+                // CycleTime < 0 -> Reset CycleTime to default value
+                if (i64Value < 0)
+                {
+                    i64Value = DEFAULT_DATA_PACKET_PUB_CYCLE_TIME;
+                }
+                if (i64Value <= MAX_SET_DATA_PACKET_PUB_CYCLE_TIME)
+                {
+                    ui32DataPackCycleTm_g = (uint32_t)i64Value;
+                    TRACE1("   Set 'DataPackCycleTm': %lu [sec]\n", (ui32DataPackCycleTm_g / 1000));
+                }
+            }
+        }
+
+        // Message scheme: 'SmBrd/<DevID>/Settings/PrintSensorVal'
+        if (strMsgTopic_p == astrMqttSubscribeTopicList_g[3])
         {
             iValue = strMsgPayload.substring(0,1).toInt();
             fPrintSensorValues_g = (iValue != 0) ? true : false;
@@ -1767,7 +2143,7 @@ bool    fLedState;
         }
 
         // Message scheme: 'SmBrd/<DevID>/Settings/PrintMqttDataProc'
-        if (strMsgTopic_p == astrMqttSubscribeTopicList_g[3])
+        if (strMsgTopic_p == astrMqttSubscribeTopicList_g[4])
         {
             iValue = strMsgPayload.substring(0,1).toInt();
             fPrintMqttDataProc_g = (iValue != 0) ? true : false;
@@ -1779,7 +2155,7 @@ bool    fLedState;
         TRACE0("   Recognized Messages Typ: 'OutData'\n");
 
         // Message scheme: 'SmBrd/<DevID>/OutData/LedBar'
-        if (strMsgTopic_p == astrMqttSubscribeTopicList_g[4])
+        if (strMsgTopic_p == astrMqttSubscribeTopicList_g[5])
         {
             LedBarIndicator_g = kLedBarNone;                        // prevent overwriting of LED Bar by other sources
             iValue = strMsgPayload.substring(0,1).toInt();
@@ -1797,7 +2173,7 @@ bool    fLedState;
         }
 
         // Message scheme: 'SmBrd/<DevID>/OutData/Led'
-        if (strMsgTopic_p == astrMqttSubscribeTopicList_g[6])
+        if (strMsgTopic_p == astrMqttSubscribeTopicList_g[7])
         {
             LedBarIndicator_g = kLedBarNone;                        // prevent overwriting of LED Bar by other sources
             iLedNum = strMsgPayload.substring(0,1).toInt();
@@ -1805,6 +2181,18 @@ bool    fLedState;
             fLedState = (iValue != 0) ? HIGH : LOW;
             TRACE2("   Set 'Led': %d to: %d\n", iLedNum, fLedState);
             AppSetLed(iLedNum, fLedState);
+        }
+    }
+    else if (strMsgTopic.indexOf("ack") > 0)
+    {
+        TRACE0("   Recognized Messages Typ: 'Ack'\n");
+
+        // Message scheme: 'SmBrd/<DevID>/Ack/PacketNum'
+        if (strMsgTopic_p == astrMqttSubscribeTopicList_g[8])
+        {
+            i64Value = strtoll(strMsgPayload.c_str(), NULL, 10);
+            ui32LastAckMqttPacketNum_g = (uint32_t)i64Value;
+            TRACE1("   Received ACK for 'PacketNum': %lu\n", ui32LastAckMqttPacketNum_g);
         }
     }
     else
@@ -2079,11 +2467,13 @@ String  strRuntimeConfig;
 
 
     strRuntimeConfig  = "";
-    strRuntimeConfig += AppCfgData_g.m_fAppRtOpt1 ? "N" : "";     // (N)etworkScan          (-> DEFAULT_CFG_ENABLE_NETWORK_SCAN)
-    strRuntimeConfig += AppCfgData_g.m_fAppRtOpt2 ? "I" : "";     // (I)/O                  (-> DEFAULT_CFG_ENABLE_DI_DO)
-    strRuntimeConfig += AppCfgData_g.m_fAppRtOpt3 ? "T" : "";     // (T)emperature+Humidity (-> DEFAULT_CFG_ENABLE_DHT_SENSOR)
-    strRuntimeConfig += AppCfgData_g.m_fAppRtOpt4 ? "C" : "";     // (C)O2                  (-> DEFAULT_CFG_ENABLE_MHZ_SENSOR)
-    strRuntimeConfig += AppCfgData_g.m_fAppRtOpt5 ? "L" : "";     // Status(L)ed            (-> DEFAULT_CFG_ENABLE_STATUS_LED)
+    strRuntimeConfig += AppCfgData_g.m_fAppRtOpt1 ? "N" : "";     // (N)etworkScan              (-> DEFAULT_CFG_ENABLE_NETWORK_SCAN)
+    strRuntimeConfig += AppCfgData_g.m_fAppRtOpt2 ? "I" : "";     // (I)/O                      (-> DEFAULT_CFG_ENABLE_DI_DO)
+    strRuntimeConfig += AppCfgData_g.m_fAppRtOpt3 ? "T" : "";     // (T)emperature+Humidity     (-> DEFAULT_CFG_ENABLE_DHT_SENSOR)
+    strRuntimeConfig += AppCfgData_g.m_fAppRtOpt4 ? "C" : "";     // (C)O2                      (-> DEFAULT_CFG_ENABLE_MHZ_SENSOR)
+    strRuntimeConfig += AppCfgData_g.m_fAppRtOpt5 ? "L" : "";     // Status(L)ed                (-> DEFAULT_CFG_ENABLE_STATUS_LED)
+    strRuntimeConfig += AppCfgData_g.m_fAppRtOpt6 ? "W" : "";     // (W)atchdog                 (-> DEFAULT_CFG_ENABLE_HW_WDT)
+    strRuntimeConfig += AppCfgData_g.m_fAppRtOpt7 ? "A" : "";     // Serve Watchdog on (A)CK    (-> DEFAULT_CFG_SRV_WDT_ON_MQTT_RECV)
 
     return (strRuntimeConfig);
 
@@ -2103,11 +2493,15 @@ String  strRuntimeConfig;
 //  Process Inputs
 //---------------------------------------------------------------------------
 
-void  AppProcessInputs()
+void  AppProcessInputs (tSensorData* pSensorDataRec_p, bool fPrintSensorValues_p)
 {
 
 int  iStateKey0;
 int  iStateKey1;
+
+
+    pSensorDataRec_p->m_iKey0Changed = 0;
+    pSensorDataRec_p->m_iKey1Changed = 0;
 
 
     // process KEY0
@@ -2116,19 +2510,21 @@ int  iStateKey1;
     {
         if (iStateKey0 == 1)
         {
-            if ( fPrintMqttDataProc_g )
+            if ( fPrintSensorValues_p )
             {
                 Serial.println("State changed: KEY0=1");
             }
-            MqttPublishData(astrMqttPublishTopicList_g[0].c_str(), "1", true, fPrintMqttDataProc_g);
+            pSensorDataRec_p->m_iKey0 = 1;
+            pSensorDataRec_p->m_iKey0Changed = 1;
         }
         else
         {
-            if ( fPrintMqttDataProc_g )
+            if ( fPrintSensorValues_p )
             {
                 Serial.println("State changed: KEY0=0");
             }
-            MqttPublishData(astrMqttPublishTopicList_g[0].c_str(), "0", true, fPrintMqttDataProc_g);
+            pSensorDataRec_p->m_iKey0 = 0;
+            pSensorDataRec_p->m_iKey0Changed = 1;
         }
 
         iLastStateKey0_g = iStateKey0;
@@ -2140,19 +2536,21 @@ int  iStateKey1;
     {
         if (iStateKey1 == 1)
         {
-            if ( fPrintMqttDataProc_g )
+            if ( fPrintSensorValues_p )
             {
                 Serial.println("State changed: KEY1=1");
             }
-            MqttPublishData(astrMqttPublishTopicList_g[1].c_str(), "1", true, fPrintMqttDataProc_g);
+            pSensorDataRec_p->m_iKey1 = 1;
+            pSensorDataRec_p->m_iKey1Changed = 1;
         }
         else
         {
-            if ( fPrintMqttDataProc_g )
+            if ( fPrintSensorValues_p )
             {
                 Serial.println("State changed: KEY1=0");
             }
-            MqttPublishData(astrMqttPublishTopicList_g[1].c_str(), "0", true, fPrintMqttDataProc_g);
+            pSensorDataRec_p->m_iKey1 = 0;
+            pSensorDataRec_p->m_iKey1Changed = 1;
         }
 
         iLastStateKey1_g = iStateKey1;
@@ -2168,15 +2566,15 @@ int  iStateKey1;
 //  Process DHT Sensor (Temperature/Humidity)
 //---------------------------------------------------------------------------
 
-void  AppProcessDhtSensor (uint32_t ui32DhtReadInterval_p, bool fPrintSensorValues_p, bool fPrintMqttDataProc_p)
+void  AppProcessDhtSensor (uint32_t ui32DhtReadInterval_p, tSensorData* pSensorDataRec_p, bool fPrintSensorValues_p)
 {
 
 char      szSensorValues[64];
 uint32_t  ui32CurrTick;
 float     flTemperature;
 float     flHumidity;
-String    strTemperature;
-String    strHumidity;
+float     flAverageTemperature;
+float     flAverageHumidity;
 
 
     ui32CurrTick = millis();
@@ -2188,23 +2586,23 @@ String    strHumidity;
         // check if values read from DHT22 sensor are valid
         if ( !isnan(flTemperature) && !isnan(flHumidity) )
         {
-            // chache DHT22 sensor values for displaying in the LED Bar indicator
-            flDhtTemperature_g = flTemperature;
-            flDhtHumidity_g    = flHumidity;
+            // use average values to eliminate noise
+            flAverageTemperature = AverageTemperature_g.CalcMovingAverage(flTemperature);
+            pSensorDataRec_p->m_flTemperature = flAverageTemperature;
+            flAverageHumidity = AverageHumidity_g.CalcMovingAverage(flHumidity);
+            pSensorDataRec_p->m_flHumidity = flAverageHumidity;
 
-            strTemperature = String(flTemperature, 1);                      // convert float to String with one decimal place
-            strHumidity = String(flHumidity, 1);                            // convert float to String with one decimal place
+            // chache DHT22 sensor values for displaying in the LED Bar indicator
+            flDhtTemperature_g = flAverageTemperature;
+            flDhtHumidity_g    = flAverageHumidity;
 
             // print DHT22 sensor values in Serial Console (Serial Monitor)
             if ( fPrintSensorValues_p )
             {
-                snprintf(szSensorValues, sizeof(szSensorValues), "DHT22: Temperature=%s, Humidity=%s", strTemperature.c_str(), strHumidity.c_str());
+                snprintf(szSensorValues, sizeof(szSensorValues), "DHT22: Temperature = %.1f °C (Ø %.1f °C), Humidity = %.1f %% (Ø %.1f %%)", flTemperature, flAverageTemperature, flHumidity, flAverageHumidity);
                 Serial.println(szSensorValues);
+                Serial.flush();
             }
-
-            // publish DHT22 sensor values
-            MqttPublishData(astrMqttPublishTopicList_g[2].c_str(), strTemperature.c_str(), true, fPrintMqttDataProc_p);
-            MqttPublishData(astrMqttPublishTopicList_g[3].c_str(), strHumidity.c_str(), true, fPrintMqttDataProc_p);
         }
         else
         {
@@ -2225,40 +2623,33 @@ String    strHumidity;
 //  Process MH-Z19 Sensor (CO2Value/SensorTemperature)
 //---------------------------------------------------------------------------
 
-void  AppProcessMhz19Sensor (uint32_t ui32Mhz19ReadInterval_p, bool fPrintSensorValues_p, bool fPrintMqttDataProc_p)
+void  AppProcessMhz19Sensor (uint32_t ui32Mhz19ReadInterval_p, tSensorData* pSensorDataRec_p, bool fPrintSensorValues_p)
 {
 
 char      szSensorValues[64];
 uint32_t  ui32CurrTick;
 int       iMhz19Co2Value;
 int       iMhz19Co2SensTemp;
-String    strCo2Value;
-String    strCo2SensTemp;
 
 
     ui32CurrTick = millis();
     if ((ui32CurrTick - ui32LastTickMhz19Read_g) >= ui32Mhz19ReadInterval_p)
     {
         iMhz19Co2Value    = Mhz19Sensor_g.getCO2();                     // MH-Z19: Request CO2 (as ppm)
+        pSensorDataRec_p->m_iCo2Value = iMhz19Co2Value;
         iMhz19Co2SensTemp = Mhz19Sensor_g.getTemperature();             // MH-Z19: Request Sensor Temperature (as Celsius)
+        pSensorDataRec_p->m_iCo2SensTemp = iMhz19Co2SensTemp;
 
-        // chache MH-Z19 sensor value for processing in HTML document and for displaying in the LED Bar indicator
+        // chache MH-Z19 sensor value for displaying in the LED Bar indicator
         iMhz19Co2Value_g    = iMhz19Co2Value;
         iMhz19Co2SensTemp_g = iMhz19Co2SensTemp;
-
-        strCo2Value = String(iMhz19Co2Value);                           // convert int to String
-        strCo2SensTemp = String(iMhz19Co2SensTemp);                     // convert int to String
 
         // print MH-Z19 sensor values in Serial Console (Serial Monitor)
         if ( fPrintSensorValues_p )
         {
-            snprintf(szSensorValues, sizeof(szSensorValues), "MH-Z19: CO2(ppm)=%s, SensTemp=%s", strCo2Value.c_str(), strCo2SensTemp.c_str());
+            snprintf(szSensorValues, sizeof(szSensorValues), "MH-Z19: CO2(ppm)=%i, SensTemp=%i", iMhz19Co2Value, iMhz19Co2SensTemp);
             Serial.println(szSensorValues);
         }
-
-        // publish MH-Z19 sensor values
-        MqttPublishData(astrMqttPublishTopicList_g[4].c_str(), strCo2Value.c_str(), true, fPrintMqttDataProc_p);
-        MqttPublishData(astrMqttPublishTopicList_g[5].c_str(), strCo2SensTemp.c_str(), true, fPrintMqttDataProc_p);
 
         ui32LastTickMhz19Read_g = ui32CurrTick;
     }
@@ -2720,6 +3111,176 @@ int       iIdx;
     strMacID.toUpperCase();
 
     return (strMacID);
+
+}
+
+
+
+//---------------------------------------------------------------------------
+//  Get System Uptime
+//---------------------------------------------------------------------------
+
+String  GetSysUptime (uint32_t* pui32Uptime_p)
+{
+
+uint32_t  ui32Uptime;
+String    strUptime;
+
+
+    ui32Uptime = millis();
+    strUptime = FormatDateTime(ui32Uptime, false, true);
+
+    *pui32Uptime_p = ui32Uptime;
+    return (strUptime);
+
+}
+
+
+
+//---------------------------------------------------------------------------
+//  Format Date/Time
+//---------------------------------------------------------------------------
+
+String  FormatDateTime (uint32_t ui32TimeTicks_p, bool fForceDay_p, bool fForceTwoDigitsHours_p)
+{
+
+const uint32_t  MILLISECONDS_PER_DAY    = 86400000;
+const uint32_t  MILLISECONDS_PER_HOURS  = 3600000;
+const uint32_t  MILLISECONDS_PER_MINUTE = 60000;
+const uint32_t  MILLISECONDS_PER_SECOND = 1000;
+
+
+char      szTextBuff[64];
+uint32_t  ui32TimeTicks;
+uint32_t  ui32Days;
+uint32_t  ui32Hours;
+uint32_t  ui32Minutes;
+uint32_t  ui32Seconds;
+String    strDateTime;
+
+
+    ui32TimeTicks = ui32TimeTicks_p;
+
+    ui32Days = ui32TimeTicks / MILLISECONDS_PER_DAY;
+    ui32TimeTicks = ui32TimeTicks - (ui32Days * MILLISECONDS_PER_DAY);
+
+    ui32Hours = ui32TimeTicks / MILLISECONDS_PER_HOURS;
+    ui32TimeTicks = ui32TimeTicks - (ui32Hours * MILLISECONDS_PER_HOURS);
+
+    ui32Minutes = ui32TimeTicks / MILLISECONDS_PER_MINUTE;
+    ui32TimeTicks = ui32TimeTicks - (ui32Minutes * MILLISECONDS_PER_MINUTE);
+
+    ui32Seconds = ui32TimeTicks / MILLISECONDS_PER_SECOND;
+
+    if ( (ui32Days > 0) || fForceDay_p )
+    {
+        snprintf(szTextBuff, sizeof(szTextBuff), "%ud/%02u:%02u:%02u", (uint)ui32Days, (uint)ui32Hours, (uint)ui32Minutes, (uint)ui32Seconds);
+    }
+    else
+    {
+        if ( fForceTwoDigitsHours_p )
+        {
+            snprintf(szTextBuff, sizeof(szTextBuff), "%02u:%02u:%02u", (uint)ui32Hours, (uint)ui32Minutes, (uint)ui32Seconds);
+        }
+        else
+        {
+            snprintf(szTextBuff, sizeof(szTextBuff), "%u:%02u:%02u", (uint)ui32Hours, (uint)ui32Minutes, (uint)ui32Seconds);
+        }
+    }
+    strDateTime = String(szTextBuff);
+
+    return (strDateTime);
+
+}
+
+
+
+//---------------------------------------------------------------------------
+//  Decode Boot/Restart Reason
+//---------------------------------------------------------------------------
+
+String  DecodeBootReason (esp_reset_reason_t eBootReason_p)
+{
+
+String  strBootReason;
+
+
+    switch (eBootReason_p)
+    {
+        case ESP_RST_UNKNOWN:       // 0
+        {
+            strBootReason = "Unknown reset reason (ESP_RST_UNKNOWN)";
+            break;
+        }
+
+        case ESP_RST_POWERON:       // 1
+        {
+            strBootReason = "Reset due to power-on event (ESP_RST_POWERON)";
+            break;
+        }
+
+        case ESP_RST_EXT:           // 2
+        {
+            strBootReason = "Reset by external pin - not applicable for ESP32 (ESP_RST_EXT)";
+            break;
+        }
+
+        case ESP_RST_SW:            // 3
+        {
+            strBootReason = "Software reset via esp_restart (ESP_RST_SW)";
+            break;
+        }
+
+        case ESP_RST_PANIC:         // 4
+        {
+            strBootReason = "Software reset due to exception/panic (ESP_RST_PANIC)";
+            break;
+        }
+
+        case ESP_RST_INT_WDT:       // 5
+        {
+            strBootReason = "Reset (software or hardware) due to interrupt watchdog (ESP_RST_INT_WDT)";
+            break;
+        }
+
+        case ESP_RST_TASK_WDT:      // 6
+        {
+            strBootReason = "Reset due to task watchdog (ESP_RST_TASK_WDT)";
+            break;
+        }
+
+        case ESP_RST_WDT:           // 7
+        {
+            strBootReason = "Reset due to other watchdogs (ESP_RST_WDT)";
+            break;
+        }
+
+        case ESP_RST_DEEPSLEEP:     // 8
+        {
+            strBootReason = "Reset after exiting deep sleep mode (ESP_RST_DEEPSLEEP)";
+            break;
+        }
+
+        case ESP_RST_BROWNOUT:      // 9
+        {
+            strBootReason = "Brownout reset by software or hardware (ESP_RST_BROWNOUT)";
+            break;
+        }
+
+        case ESP_RST_SDIO:          // 10
+        {
+            strBootReason = "Reset over SDIO (ESP_RST_SDIO)";
+            break;
+        }
+
+        default:                    // ???
+        {
+            strBootReason = "??? unknown ???";
+            break;
+        }
+    }
+
+    return (strBootReason);
 
 }
 
